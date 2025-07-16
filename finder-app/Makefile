@@ -1,7 +1,7 @@
 CROSS_COMPILER?=
 
 default:
-	echo $(pwd)
+	echo $(shell pwd)
 	$(CROSS_COMPILER)gcc writer.c -o writer
 	file writer > ../assignment2/fileresult.txt
 
