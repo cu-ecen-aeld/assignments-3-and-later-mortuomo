@@ -1,3 +1,11 @@
 [submodule "assignment-autotest"]
 	path = assignment-autotest
 	url = https://github.com/cu-ecen-aeld/assignment-autotest.git
+
+[submodule "assignment-2-mortuomo/assignment-2-mortuomo"]
+	path = assignment-2-mortuomo/assignment-2-mortuomo
+	url = https://github.com/cu-ecen-aeld/assignment-2-mortuomo.git
+
+[submodule "assignments-3-and-later-mortuomo/assignments-3-and-later-mortuomo"]
+	path = assignments-3-and-later-mortuomo/assignments-3-and-later-mortuomo
+	url = https://github.com/cu-ecen-aeld/assignments-3-and-later-mortuomo.git
