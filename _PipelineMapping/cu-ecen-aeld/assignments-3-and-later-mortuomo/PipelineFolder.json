@@ -1,0 +1,12 @@
+﻿{
+  "repositoryName": "cu-ecen-aeld/assignments-3-and-later-mortuomo",
+  "pipelineDirectory": "assignments-3-and-later-mortuomo",
+  "workspaceDirectory": "assignments-3-and-later-mortuomo/assignments-3-and-later-mortuomo",
+  "repositories": {
+    "cu-ecen-aeld/assignments-3-and-later-mortuomo": {
+      "repositoryPath": "assignments-3-and-later-mortuomo/assignments-3-and-later-mortuomo",
+      "lastRunOn": "07/23/2025 05:24:53 +02:00"
+    }
+  },
+  "lastRunOn": "07/23/2025 05:24:53 +02:00"
+}

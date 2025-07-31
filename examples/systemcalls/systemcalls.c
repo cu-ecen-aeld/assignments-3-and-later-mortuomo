@@ -4,13 +4,27 @@
 
 #define LOG_IDENT "fork_exec_wait"
 
-bool fork_exec_wait(char **command) {
+#define fork_exec_wait(command) \
+    fork_exec_wait_redirect((const char *)NULL, command)
+
+bool fork_exec_wait_redirect(const char *outputfile, char **command) {
 
     pid_t child_pid, waited_pid;
     int wstatus;
     int exec_rc;
+    int outputfile_fd;
 
     openlog(LOG_IDENT, 0, LOG_USER);
+
+    if (NULL != outputfile) { // if stdout needs to be redirected
+
+        // try to open the file for redirection
+        // exit on failure with open() error code
+        outputfile_fd = open(outputfile, O_WRONLY|O_CREAT);
+        if (! outputfile_fd ) {
+            return false;
+        }
+    }
 
     // fork step, return on error
     switch (child_pid = fork()) {
@@ -20,15 +34,34 @@ bool fork_exec_wait(char **command) {
             return false;
 
         case 0: // this is running in the child process
-            syslog(LOG_DEBUG, "Running execv(%s, %s, %s...)", command[0], command[1], command[2]);
+
+            if (NULL != outputfile) { // can we do it without needing 3 ifs?
+                // redirect stdout 
+                // exit on error
+                int retval = dup2(outputfile_fd, STDOUT_FILENO);
+                if (retval < 0) {
+                    syslog(LOG_ERR, "Couldn't redirect stdout\n");
+                    exit(retval); // return code should be checked by caller
+                }
+            }
+
+            //syslog(LOG_DEBUG, "Running execv(%s, %s, %s...)", command[0], command[1], command[2]);
             exec_rc = execv(command[0], command);
 
             syslog(LOG_DEBUG, "execv() returned code %i", exec_rc);
-            _exit(exec_rc);
+            exit(exec_rc);
         
         default: // this is running in the caller
             // wait for child, return on error
             waited_pid = waitpid(child_pid, &wstatus, 0);
+
+            // close outputfile if output was redirected
+            // can we do it without needing 3 ifs?
+            if (NULL != outputfile) {
+                close(outputfile_fd);
+            }
+            
+
             if (waited_pid != child_pid) {
                 syslog(LOG_ERR, "wait() returned pid %i, expected %i", waited_pid, child_pid);
                 return false;
@@ -161,21 +194,6 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     *   The rest of the behaviour is same as do_exec()
     *
     */
-    bool retval = false; 
-    int fd;
 
-    if (!(fd = open(outputfile, O_WRONLY|O_CREAT))) {
-        return false;
-    }
-
-    if (dup2(fd, STDOUT_FILENO) < 0) {
-        retval = false;
-        goto exit;
-    }
-
-    retval = fork_exec_wait(command);
-
-exit:
-    close(fd);
-    return retval;
+    return fork_exec_wait_redirect(outputfile, command);
 }

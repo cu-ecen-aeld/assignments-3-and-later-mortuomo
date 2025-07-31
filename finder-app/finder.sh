@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 
 # check number of args
@@ -20,7 +20,7 @@ then
 fi
 
 # store filenames in filesdir and subdirs
-files_in_filesdir_and_subdirs=$( find -L "$filesdir" -type f,c,b,s,p )
+files_in_filesdir_and_subdirs=$( find -L "$filesdir" -type f )
 
 # count files in filesdir and subdirectories
 n_files_in_filesdir_and_subdirs=0
