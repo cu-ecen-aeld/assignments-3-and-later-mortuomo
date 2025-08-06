@@ -5,10 +5,25 @@
 set -e
 set -u
 
+# Additions for buildroot assignments:
+# 	- 	scripts are assumed to be somewhere on PATH rather than the current directory
+#		the path where to find the scripts is specified in the SCRIPTS_DIR variable
+# 		example: ./writer -> writer
+#	-	configuration files are under a specific absolute path and not under the current directory
+#		the path is specified in the CONF_DIR_PARENT_PATH variable
+#		example: conf/username.txt -> /etc/finder-app/conf/username.txt
+#	-	the ouput of the finder command is written to a file
+#		the file's path is specified in the FINDER_OUTPUT_FILE variable
+
+
 NUMFILES=10
 WRITESTR=AELD_IS_FUN
 WRITEDIR=/tmp/aeld-data
-username=$(cat conf/username.txt)
+CONF_DIR_PARENT_PATH="/etc/finder-app/"
+SCRIPTS_DIR="" # if "" scripts must be on PATH
+FINDER_OUTPUT_FILE="/tmp/assignment4-result.txt"
+username=$(cat ${CONF_DIR_PARENT_PATH}/conf/username.txt)
+
 
 if [ $# -lt 3 ]
 then
@@ -32,7 +47,7 @@ echo "Writing ${NUMFILES} files containing string ${WRITESTR} to ${WRITEDIR}"
 rm -rf "${WRITEDIR}"
 
 # create $WRITEDIR if not assignment1
-assignment=`cat conf/assignment.txt`
+assignment=`cat ${CONF_DIR_PARENT_PATH}/conf/assignment.txt`
 
 if [ $assignment != 'assignment1' ]
 then
@@ -54,10 +69,13 @@ fi
 
 for i in $( seq 1 $NUMFILES)
 do
-	./writer "$WRITEDIR/${username}$i.txt" "$WRITESTR"
+	${SCRIPTS_DIR}writer "$WRITEDIR/${username}$i.txt" "$WRITESTR"
 done
 
-OUTPUTSTRING=$(./finder.sh "$WRITEDIR" "$WRITESTR")
+OUTPUTSTRING=$(${SCRIPTS_DIR}finder.sh "$WRITEDIR" "$WRITESTR")
+
+# write OUTPUTSTRING to file
+echo "${OUTPUTSTRING}" > ${FINDER_OUTPUT_FILE}
 
 # remove temporary directories
 rm -rf /tmp/aeld-data

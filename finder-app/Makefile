@@ -1,8 +1,9 @@
-CROSS_COMPILE?=
+# CROSS_COMPILE?=
 
 default:
-	$(CROSS_COMPILE)gcc writer.c -o writer
+	$(CC) $(CFLAGS) $(INCLUDES) writer.c -o writer $(LDFLAGS)
 
 clean:
 	rm -rf *.o ./writer
 	
+all: default
