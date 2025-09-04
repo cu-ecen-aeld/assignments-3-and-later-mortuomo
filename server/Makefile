@@ -1,4 +1,5 @@
 FILENAME = aesdsocket
+CFLAGS ?= -Wall -Werror -g
 
 .PHONY: all default clean
 
