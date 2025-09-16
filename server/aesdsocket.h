@@ -18,13 +18,23 @@
 #include <pthread.h>
 
 #define LOG_IDENT       NULL                        // program identity shown in logs (defaults to the name of the executable)
-#define DUMPFILE_NAME   "/var/tmp/aesdsocketdata"   // file to dump received packets to
 #define PORTNO          "9000"                      // port to open for listening
 #define BACKLOG         5                           // number of clients allowed in queue, others will be turned away
 #define E_ON_SOCKET     -1                          // code to return in case of errors
 #define BUF_SIZE        256                         // bytes received at a time from socket
 #define TIMER_INTERVAL_SECONDS		10				// period for timestamping dumpfile
 #define MAX_TIMER_CREATE_ATTEMPTS 	10				// number of retries if timer_creates returns EAGAIN
+
+// if 1 writes to aesd char device, if 0 writes to tempfile
+#define USE_AESD_CHAR_DEVICE 1
+
+#if USE_AESD_CHAR_DEVICE
+#define DUMPFILE_NAME	"/dev/aesdchar"
+
+#else
+#define DUMPFILE_NAME   "/var/tmp/aesdsocketdata"   // file to dump received packets to
+
+#endif
 
 // way for threads to signal their status
 enum thread_status {

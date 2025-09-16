@@ -2,13 +2,193 @@
 
 #define THREAD_DUMPFILE_NAME "/tmp/.aesdsocket_"
 
+// if writing to a char device, parts of the code have to be omitted
+#if USE_AESD_CHAR_DEVICE /* write to char device */
+
+/**
+ * Do nothing and return success. Locking is handled by the char device driver.
+ */
+static inline int lock_dumpfile(pthread_mutex_t *mutex) { 
+	return 0;
+}
+
+/**
+ * Do nothing and return success. Locking is handled by the char device driver.
+ */
+static inline int unlock_dumpfile(pthread_mutex_t *mutex) { 
+	return 0;
+}
+
+/**
+ * Do nothing and return success, char device node shall not be removed.
+ */
+static inline int remove_dumpfile(const char* filename) {
+	return 0;
+}
+
+/**
+ * Do nothing and return success, timestamps would flood the circular buffer.
+ */
+static inline int timer_setup(timer_t *timerid) {
+	return 0; 
+}
+
+
+#else /* write to normal file */
+
+/**
+ * Lock mutex of dumpfile. Wrapper of int pthread_mutex_lock()
+ */
+static inline int lock_dumpfile(pthread_mutex_t *mutex) { 
+	return pthread_mutex_lock(mutex);
+}
+
+/**
+ * Unlock mutex of dumpfile. Wrapper of int pthread_mutex_unlock()
+ */
+static inline int unlock_dumpfile(pthread_mutex_t *mutex) { 
+	return pthread_mutex_unlock(mutex);
+}
+
+/**
+ * Remove dumpfile, as part of the cleanup. Wrapper of 
+ * int remove(const char *__filename)
+ */
+static inline int remove_dumpfile(const char* filename) {
+	return remove(filename);
+}
+
+/*
+* Helper function to create timer and set its time
+* Arguments:
+* - timerid: pointer to buffer where to write timer id on creation. Must not be NULL.
+*
+* Returns:
+* - 0 on success
+* - last error code otherwise, see errno.h
+*/
+static int timer_setup(timer_t *timerid) {
+
+	struct sigevent timer_sigevent = { // struct sigevent to pass to timer_create
+		.sigev_notify = SIGEV_THREAD, // run function "as if" it was the first function in a dedicated thread
+		.sigev_signo = SIGALRM, // not used
+		.sigev_value.sival_ptr = &dumpfile_mutex, // argument to pass to timer function
+		._sigev_un._sigev_thread = {
+			._attribute = NULL,
+			._function = timer_func // function to call
+		} 
+	};
+	struct itimerspec timer_spec = { // argument to timer_settime
+		.it_interval = { // period over which to run the timer function
+			.tv_sec = TIMER_INTERVAL_SECONDS,
+			.tv_nsec = 0
+		},
+		.it_value = { // initial wait to trigger the timer, must not be 0 or the timer is disabled
+			.tv_sec = TIMER_INTERVAL_SECONDS,
+			.tv_nsec = 0
+		}	
+	};
+	int rc, create_attempts;
+
+
+	// timerid must not be NULL
+	if (NULL == timerid) {
+		return EFAULT;
+	}
+
+	// create timer
+	rc = timer_create(CLOCK_MONOTONIC, &timer_sigevent, timerid);
+	for (create_attempts = 0; EAGAIN == rc && create_attempts < MAX_TIMER_CREATE_ATTEMPTS; create_attempts++) {
+		sleep(1);
+		rc = timer_create(CLOCK_MONOTONIC, &timer_sigevent, timerid);
+	}
+	if (0 != rc) {
+		return rc;
+	}
+
+	// set time and arm timer
+	rc = timer_settime(*timerid, 0, &timer_spec, NULL);
+	if (0 != rc) {
+		return rc;
+	}
+
+	return EXIT_SUCCESS;
+}
+
+/*
+* Routine to call every timer expiration 
+* Logs timestamp to dumpfile
+*/
+static void timer_func(union sigval sigval) {
+
+	pthread_mutex_t *dumpfile_mutex;
+	FILE *dumpfile_fp;
+	time_t raw_time;
+	struct tm *local_time;
+	int rc;
+	char time_string[24];
+
+	if (NULL == sigval.sival_ptr) {
+		return;
+	}
+
+	dumpfile_mutex = (pthread_mutex_t *) sigval.sival_ptr;
+
+
+
+	// try accessing the dumpfile
+	rc = lock_dumpfile(dumpfile_mutex);
+	if (0 != rc) {
+		syslog(LOG_WARNING, "Error %d (%s) on locking dumpfile to print timestamp", rc, strerror(rc));
+		return;
+	}
+
+	/*
+	* ENTERING THE CRITICAL SECTION
+	*/
+
+	// open file
+	dumpfile_fp = fopen(DUMPFILE_NAME, "a");
+	if (NULL == dumpfile_fp) {
+		syslog(LOG_ERR, "Error %d (%s) on opening dumpfile to print timestamp", errno, strerror(errno));
+		goto unlock_and_exit;
+	}
+
+	// get current time
+	time(&raw_time);
+	local_time = localtime(&raw_time);
+	if (0 == strftime(time_string, sizeof(time_string)/sizeof(typeof(*time_string)), "%Y/%m/%d %H:%M:%S", local_time)) {
+		syslog(LOG_ERR, "Error formatting current time");
+	}
+	else { // time formatted properly
+		// print timestamp on file
+		rc = fprintf(dumpfile_fp, "timestamp:%s\n", time_string);
+		if (rc <= 0) {
+			syslog(LOG_ERR, "Error on writing timestamp to file %s", DUMPFILE_NAME);
+		}
+	}
+
+	// close file
+	fclose(dumpfile_fp);
+
+	/*
+	* LEAVING THE CRITICAL SECTION
+	*/
+
+unlock_and_exit:
+	unlock_dumpfile(dumpfile_mutex);
+
+	return;
+}
+
+#endif /* write to char device or regular file build switch */
 
 static bool signal_to_terminate = false; // starts false, can be set to true by signal handlers
 static pthread_mutex_t dumpfile_mutex = PTHREAD_MUTEX_INITIALIZER; // mutex to control access to the dumpfile
 
 
 // Fetches IP address from sockaddr as human readable string
-int get_ip_as_string_from_sockaddr(struct sockaddr *sockaddr, char *addr_string) {
+static int get_ip_as_string_from_sockaddr(struct sockaddr *sockaddr, char *addr_string) {
 
     // First we need to figure out if it's an IPv4 or IPv6 address
     // so the sockaddr* can be cast to the appropriate data struct
@@ -41,7 +221,7 @@ int get_ip_as_string_from_sockaddr(struct sockaddr *sockaddr, char *addr_string)
 
 
 // send contents of file *filp over socket sockfd
-ssize_t send_file_contents(int sockfd, char *filename) {
+static ssize_t send_file_contents(int sockfd, char *filename) {
 
     ssize_t n_bytes_sent = 0, n_bytes_sent_this_iter;
     size_t n_bytes_read = 0;
@@ -93,7 +273,7 @@ ssize_t send_file_contents(int sockfd, char *filename) {
 * Returns number of characters copied
 * No error handling for now, what can possibly go wrong? ;)
 */
-ssize_t copy_file_contents(FILE *from, FILE* to) {
+static ssize_t copy_file_contents(FILE *from, FILE* to) {
 
 	int char_to_copy; // fgetc and fputc work with ints, but why? what's the "c" for?
 	ssize_t n_chars_copied = 0;
@@ -112,7 +292,7 @@ ssize_t copy_file_contents(FILE *from, FILE* to) {
  * The main server loop will exit after completing the current iteration
  * upon receiving SIGINT and SIGTERM
 */
-void signal_handler(int signum) {
+static void signal_handler(int signum) {
 
     switch (signum) {
 
@@ -125,130 +305,6 @@ void signal_handler(int signum) {
     }
 
     return;
-}
-
-/*
-* Routine to call every timer expiration 
-* Logs timestamp to dumpfile
-*/
-void timer_func(union sigval sigval) {
-
-	pthread_mutex_t *dumpfile_mutex;
-	FILE *dumpfile_fp;
-	time_t raw_time;
-	struct tm *local_time;
-	int rc;
-	char time_string[24];
-
-	if (NULL == sigval.sival_ptr) {
-		return;
-	}
-
-	dumpfile_mutex = (pthread_mutex_t *) sigval.sival_ptr;
-
-
-
-	// try accessing the dumpfile
-	rc = pthread_mutex_lock(dumpfile_mutex);
-	if (0 != rc) {
-		syslog(LOG_WARNING, "Error %d (%s) on locking dumpfile to print timestamp", rc, strerror(rc));
-		return;
-	}
-
-	/*
-	* ENTERING THE CRITICAL SECTION
-	*/
-
-	// open file
-	dumpfile_fp = fopen(DUMPFILE_NAME, "a");
-	if (NULL == dumpfile_fp) {
-		syslog(LOG_ERR, "Error %d (%s) on opening dumpfile to print timestamp", errno, strerror(errno));
-		goto unlock_and_exit;
-	}
-
-	// get current time
-	time(&raw_time);
-	local_time = localtime(&raw_time);
-	if (0 == strftime(time_string, sizeof(time_string)/sizeof(typeof(*time_string)), "%Y/%m/%d %H:%M:%S", local_time)) {
-		syslog(LOG_ERR, "Error formatting current time");
-	}
-	else { // time formatted properly
-		// print timestamp on file
-		rc = fprintf(dumpfile_fp, "timestamp:%s\n", time_string);
-		if (rc <= 0) {
-			syslog(LOG_ERR, "Error on writing timestamp to file %s", DUMPFILE_NAME);
-		}
-	}
-
-	// close file
-	fclose(dumpfile_fp);
-
-	/*
-	* LEAVING THE CRITICAL SECTION
-	*/
-
-unlock_and_exit:
-	pthread_mutex_unlock(dumpfile_mutex);
-
-	return;
-}
-
-
-/*
-* Helper function to create timer and set its time
-* Arguments:
-* - timerid: pointer to buffer where to write timer id on creation. Must not be NULL.
-*
-* Returns:
-* - 0 on success
-* - last error code otherwise, see errno.h
-*/
-int timer_setup(timer_t *timerid) {
-
-	struct sigevent timer_sigevent = { // struct sigevent to pass to timer_create
-		.sigev_notify = SIGEV_THREAD, // run function "as if" it was the first function in a dedicated thread
-		.sigev_signo = SIGALRM, // not used
-		.sigev_value.sival_ptr = &dumpfile_mutex, // argument to pass to timer function
-		._sigev_un._sigev_thread = {
-			._attribute = NULL,
-			._function = timer_func // function to call
-		} 
-	};
-	struct itimerspec timer_spec = { // argument to timer_settime
-		.it_interval = { // period over which to run the timer function
-			.tv_sec = TIMER_INTERVAL_SECONDS,
-			.tv_nsec = 0
-		},
-		.it_value = { // initial wait to trigger the timer, must not be 0 or the timer is disabled
-			.tv_sec = TIMER_INTERVAL_SECONDS,
-			.tv_nsec = 0
-		}	
-	};
-	int rc, create_attempts;
-
-
-	// timerid must not be NULL
-	if (NULL == timerid) {
-		return EFAULT;
-	}
-
-	// create timer
-	rc = timer_create(CLOCK_MONOTONIC, &timer_sigevent, timerid);
-	for (create_attempts = 0; EAGAIN == rc && create_attempts < MAX_TIMER_CREATE_ATTEMPTS; create_attempts++) {
-		sleep(1);
-		rc = timer_create(CLOCK_MONOTONIC, &timer_sigevent, timerid);
-	}
-	if (0 != rc) {
-		return rc;
-	}
-
-	// set time and arm timer
-	rc = timer_settime(*timerid, 0, &timer_spec, NULL);
-	if (0 != rc) {
-		return rc;
-	}
-
-	return EXIT_SUCCESS;
 }
 
 
@@ -265,7 +321,7 @@ int timer_setup(timer_t *timerid) {
 * - 0 on success, 
 * - error code otherwise (see errno.h)
 */
-int append_thread_list_entry(struct thread_list_head *head,
+static int append_thread_list_entry(struct thread_list_head *head,
 							 struct thread_list_entry **tail) {
 
 	struct thread_list_entry *new_entry;
@@ -315,7 +371,7 @@ int append_thread_list_entry(struct thread_list_head *head,
 
 // function to group the steps to clean up threads, as it will be called both
 // in the main loop and at on shutdown
-void cleanup_threads(struct thread_list_head *head, char *ip_addr_string, bool final_cleanup) {
+static void cleanup_threads(struct thread_list_head *head, char *ip_addr_string, bool final_cleanup) {
 
 	int rc;
 	struct thread_list_entry *prev = NULL, *next;
@@ -383,7 +439,7 @@ void cleanup_threads(struct thread_list_head *head, char *ip_addr_string, bool f
 
 
 
-void *thread_routine(void *arg) {
+static void *thread_routine(void *arg) {
 
 	int rc, 
 		retval;
@@ -481,7 +537,7 @@ void *thread_routine(void *arg) {
 			*/
 			if (full_packet_received) {
 				// lock mutex
-				rc = pthread_mutex_lock(thread_data->mutex);
+				rc = lock_dumpfile(thread_data->mutex);
 				if (0 != rc) { // error on acquiring the lock
 					syslog(LOG_ERR, "Error %d (%s) on locking mutex.", rc, strerror(rc));
 					retval = rc;
@@ -497,11 +553,11 @@ void *thread_routine(void *arg) {
 				// open dump file in append mode
 				dumpfile_fd = fopen(DUMPFILE_NAME, "a");
 				if (NULL == dumpfile_fd) {
-					syslog(LOG_ERR, "Error %d (%s) on opening file %s.", errno, strerror(errno), DUMPFILE_NAME);
+					syslog(LOG_ERR, "Error %d (%m) on opening file %s.", errno, DUMPFILE_NAME);
 					retval = E_ON_SOCKET;
 
 					// don't forget we're in the critical section
-					pthread_mutex_unlock(thread_data->mutex);
+					unlock_dumpfile(thread_data->mutex);
 
 					goto close_thread_dumpfile_and_exit;
 				}
@@ -524,6 +580,9 @@ void *thread_routine(void *arg) {
 
 				// reset read cursor on thread_dumpfile. file needs to stay open to prevent other accesses
 				rewind(thread_dumpfile_fd); // post-copy, file truncated for the next cycle
+				if (truncate(thread_dumpfile_name, 0)) {
+					syslog(LOG_ERR, "Error %d (%m) truncating file %s", errno, thread_dumpfile_name);
+				}
 
 				// keep the lock or some other thread might dump its own packets
 				// and our sender will receive wrong data later
@@ -536,7 +595,7 @@ void *thread_routine(void *arg) {
 					retval = E_ON_SOCKET;
 
 					// don't forget we're in the critical section
-					pthread_mutex_unlock(thread_data->mutex);
+					unlock_dumpfile(thread_data->mutex);
 
 					goto close_thread_dumpfile_and_exit;
 				}
@@ -548,7 +607,7 @@ void *thread_routine(void *arg) {
 				* make sure every way out of the critical section involves releasing the lock
 				*/
 
-				pthread_mutex_unlock(thread_data->mutex);
+				unlock_dumpfile(thread_data->mutex);
 
 				full_packet_received = false;
 			}
@@ -712,10 +771,6 @@ main_body:
 
     /*
      * Modify to accept multiple connections, spawning a new thread for each connection
-     * TODOs:
-	 * -	Implement timer to log the time in the dumpfile. Can be in parent main loop or a dedicated thread
-	 * 		 not joined at the end.
-	 * 
 	 * DONE:
      * -    Modify BACKLOG macro in header with the number of connections to accept
      * -    Move the body of the loop, after having accepted a connection, to a function
@@ -729,6 +784,8 @@ main_body:
 	 * 		 How do you know when a thread has finished so you can free it? Check status in thread_data->status
 	 * -	Implement a mutex on the dumpfile, each thread will hold the lock while dumping the packet
 	 * 		 and sending the content back to client
+	 * -	Implement timer to log the time in the dumpfile. Can be in parent main loop or a dedicated thread
+	 * 		 not joined at the end.
 	 * 
      */
 
@@ -865,7 +922,7 @@ join_threads_and_exit:
 	// walk down linked list and wait for all threads to finish, cleaning up
 	// we have to wait for all of them so a for loop works just fine
 	cleanup_threads(&thread_list_head, ip_addr_string, true);
-    remove(DUMPFILE_NAME);
+    remove_dumpfile(DUMPFILE_NAME);
 free_poll_fds_and_exit:
 	free(poll_fds);
 close_socket_and_return:
