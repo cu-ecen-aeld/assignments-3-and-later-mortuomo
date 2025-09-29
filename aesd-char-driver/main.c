@@ -18,6 +18,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -39,6 +40,9 @@ static ssize_t copy_from_user_to_pending_buffers(struct aesd_dev *dev, const cha
 static struct aesd_buffer_entry *flush_pending_writes_into_new_entry(struct aesd_dev *dev);
 static inline bool is_pending_data_newline_terminated(struct aesd_dev *dev);
 static inline void free_pending_writes_items(struct aesd_pending_writes_item *head);
+static inline loff_t get_size(struct aesd_dev *dev);
+static long aesd_adjust_file_offset(struct file *filp, unsigned int write_cmd, unsigned int write_cmd_offset);
+static inline bool is_index_in_entry_valid_for_fpos(struct aesd_dev *dev, unsigned int index);
 static int aesd_setup_cdev(struct aesd_dev *dev);
 int aesd_init_module(void);
 void aesd_cleanup_module(void);
@@ -46,8 +50,165 @@ int aesd_open(struct inode *inode, struct file *filp);
 int aesd_release(struct inode *inode, struct file *filp);
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence);
+long aesd_unlocked_ioctl(struct file *filp, unsigned int request, unsigned long arg);
 
+/**
+ * Find size of aesd char device, as the total number of bytes written to the circular buffer.
+ * Pending data is ignored.
+ * Locking on dev must be handles by the caller
+ * @param dev: pointer to device structure
+ * @returns The total number of bytes written to the circular buffer in dev.
+ */
+static inline loff_t get_size(struct aesd_dev *dev) {
 
+    struct aesd_buffer_entry *entry;
+    loff_t retval = 0;
+    int index;
+
+    // return 0 immediately if buffer is empty
+    if (!(dev->circular_buffer->full) &&
+        dev->circular_buffer->out_offs == dev->circular_buffer->in_offs) {
+        return 0;
+    }
+
+    // sum sizes of entries in circular buffer
+    entry = NULL; // flag not to break on the first iteration on a full buffer
+    for (index = dev->circular_buffer->out_offs; // start from oldest entry
+         index != dev->circular_buffer->in_offs || entry == NULL; // up to newest entry, always pass the first check (would fail on full buffer)
+         index = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) { // wrap back to start from end of buffer
+
+        entry = dev->circular_buffer->entry + index; 
+        retval += entry->size;
+    }
+
+    return retval;
+}
+
+/**
+ * Helper to find whether write_cmd is a valid entry in into dev->circular_buffer->entry.
+ * A valid entry should have data written to it, so it's valid for reading.
+ * Locking must be handled by the caller.
+ * @param dev: aesd char device containing the circular buffer
+ * @param write_cmd: zero referenced offset in dev->circular_buffer->entry relative to oldest entry
+ * @returns true if index is a valid entry, false otherwise
+ */
+static inline bool is_index_in_entry_valid_for_fpos(struct aesd_dev *dev, unsigned int write_cmd) {
+
+    // number of entries writtenj into circular buffer
+    unsigned int entries_written
+        = dev->circular_buffer->full ?
+            AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED // if buffer is full MAX_WRITE entries have been written
+            : 
+            ((dev->circular_buffer->in_offs - dev->circular_buffer->out_offs) // otherwise check offsets
+                + AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) // make sure it's positive so the remainder is also positive
+                % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; // modulo MAX_WRITES, 0 if in_offs==out_offs, correct because buffer is not full if we get here
+
+    PDEBUG("is_index_in_entry_valid_for_fpos(...,write_cmd=%d)", write_cmd);
+
+    /**
+     * check if write_cmd is valid i.e.
+     * considering that write_cmd is relative to the oldest entry, let write_cmd_absolute be the index into the entry array
+     * 0 <= write_cmd < MAX_WRITES
+     * if buffer is not empty
+     * if in_offs > out_offs, out_offs <= write_cmd_absolute <= in_offs
+     * if in_offs < out_offs wrapped around buffer, out_offs <= write_cmd_absolute < MAX_WRITES or 0 <= write_cmd_absolute <= in_offs
+     */
+    if (write_cmd >= entries_written) {
+        PERROR("write_cmd %d is >= than number of entries written %d (in_offs = %d, out_offs = %d)",
+            write_cmd,
+            entries_written,
+            dev->circular_buffer->in_offs,
+            dev->circular_buffer->out_offs
+        );
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Adjust the file offset (f_pos) parameter of filp based on the location specified by write cmd and write_cmd_offset.
+ * Locking on filp->private_data is handled here, DO NOT LOCK BEFORE CALLING THIS.
+ * @param filp: file pointer to device
+ * @param write_cmd: zero referenced command to locate
+ * @param write_cmd_offset: zero referenced offset into the command
+ * @returns 0 if successful, -ERESTARTSYS if mutex could not be obtained, -EINVAL if write_cmd or write_cmd_offset are out of range. 
+ */
+static long aesd_adjust_file_offset(struct file *filp, unsigned int write_cmd, unsigned int write_cmd_offset) {
+
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_buffer_entry *entry; // entry into circular buffer in loop up to write_cmd offset
+    long retval, f_pos;
+    int index;
+
+    PDEBUG("adjust_file_offset(...,write_cmd=%d, write_cmd_offset=%d)", write_cmd, write_cmd_offset);
+
+    /**
+     * START OF CRITICAL SECTION
+     */
+    if (mutex_lock_interruptible(&dev->mutex)) {
+        PERROR("mutex_lock_interruptible failed in aesd_adjust_file_offset");
+        return -ERESTARTSYS;
+    }
+
+    /**
+     * check if write_cmd is a valid entry
+     */
+    if (! is_index_in_entry_valid_for_fpos(dev, write_cmd)) {
+        PERROR("write_cmd %d is not a valid entry", write_cmd);
+        retval = -EINVAL;
+        goto unlock;
+    }
+
+    /**
+     * go to entry at write_cmd offset.
+     * to compute f_pos the sizes of all preceding entries shall be summed with write_cmd_offset
+     * but it's faster to check immediately if the arguments are valid
+     */
+    entry = dev->circular_buffer->entry 
+        + ((dev->circular_buffer->out_offs + write_cmd) 
+            % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+    
+    /**
+     * check if write_cmd_offset is valid
+     */
+    if (write_cmd_offset >= entry->size) {
+        PERROR("write_cmd_offset %d is larger than entry[%d]->size %zu", write_cmd_offset, write_cmd, entry->size);
+        retval = -EINVAL;
+        goto unlock;
+    }
+
+    /**
+     * now sum the sizes of the entries up to write_cmd and write_cmd_offset
+     */
+    f_pos = 0;
+    for (index = dev->circular_buffer->out_offs;
+         index != ((dev->circular_buffer->out_offs + write_cmd) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+         index = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+
+        entry = dev->circular_buffer->entry + index;
+        f_pos += entry->size;
+    }
+    /**
+     * add write_cmd_offset
+     */
+    f_pos += write_cmd_offset;
+
+    /**
+     * finally update f_pos
+     */
+    filp->f_pos = f_pos;
+    retval = 0; // success 
+
+    /**
+     * END OF CRITICAL SECTION
+     */
+unlock:
+    mutex_unlock(&dev->mutex);
+
+    return retval;
+}
 
 /**
  * Slides down the "pending_writes_item" linked list up to the item where byte offset "offset" is.
@@ -65,7 +226,7 @@ static inline struct aesd_pending_writes_item *find_pending_writes_item_at_offse
 
     // make sure offset is legal
     if (offset > dev->bytes_pending) {
-        printk(KERN_ERR "aesdchar: offset %zu is larger than bytes_pending %zu in device", offset, dev->bytes_pending);
+        PERROR("offset %zu is larger than bytes_pending %zu in device", offset, dev->bytes_pending);
         return NULL;
     }
 
@@ -81,7 +242,7 @@ static inline struct aesd_pending_writes_item *find_pending_writes_item_at_offse
          (index < (offset / AESD_PENDING_WRITES_BUF_SIZE)) && pending_writes_item; 
          index++, pending_writes_item = pending_writes_item->next);
     if (! pending_writes_item) {
-        printk(KERN_ERR "aesdchar: offset (%li) and number of items in pending writes linked list (%i) with buffer size (%i) don't match.",
+        PERROR("offset (%li) and number of items in pending writes linked list (%i) with buffer size (%i) don't match.",
             offset, index, AESD_PENDING_WRITES_BUF_SIZE);
         return NULL;
     }
@@ -112,7 +273,7 @@ static ssize_t copy_from_user_to_pending_buffers(struct aesd_dev *dev, const cha
      * Find pending_writes_item to start writing to, based on how much data is already written to it
      */
     if (!(pending_writes_item = find_pending_writes_item_at_offset(dev, dev->bytes_pending))) {
-        printk(KERN_ERR "aesdchar: failed to find write position %zu in pending_writes_item list", dev->bytes_pending);
+        PERROR("failed to find write position %zu in pending_writes_item list", dev->bytes_pending);
         return -EFAULT;
     }
 
@@ -141,7 +302,7 @@ static ssize_t copy_from_user_to_pending_buffers(struct aesd_dev *dev, const cha
                 buf + retval, bytes_to_copy
             ))) {
 
-            printk(KERN_ERR "aesdchar: copy_from_user failed to copy %zu/%zu bytes", bytes_not_copied, bytes_to_copy);
+            PERROR("copy_from_user failed to copy %zu/%zu bytes", bytes_not_copied, bytes_to_copy);
             return -EFAULT;
         }
 
@@ -154,7 +315,7 @@ static ssize_t copy_from_user_to_pending_buffers(struct aesd_dev *dev, const cha
 
         // allocate new entry
         if (!(pending_writes_item->next = kmalloc(sizeof(pending_writes_item), GFP_KERNEL))) {
-            printk(KERN_ERR "aesdchar: failed to allocate memory for struct aesd pending_writes_item after writing %zu/%zu bytes", bytes_to_copy, count);
+            PERROR("failed to allocate memory for struct aesd pending_writes_item after writing %zu/%zu bytes", bytes_to_copy, count);
             return -ENOMEM;
         }
         // move pointer to next item
@@ -162,7 +323,7 @@ static ssize_t copy_from_user_to_pending_buffers(struct aesd_dev *dev, const cha
         pending_writes_item->next = NULL;
         // allocate buffer for new entry
         if (!(pending_writes_item->buf = kmalloc(AESD_PENDING_WRITES_BUF_SIZE, GFP_KERNEL))) {
-            printk(KERN_ERR "aesdchar: failed to allocate memory for buffer in struct aesd pending_writes_item after writing %zu/%zu bytes", bytes_to_copy, count);
+            PERROR("failed to allocate memory for buffer in struct aesd pending_writes_item after writing %zu/%zu bytes", bytes_to_copy, count);
             retval = -ENOMEM;
             goto free_pending_writes_item;
         }
@@ -187,7 +348,7 @@ static ssize_t copy_from_user_to_pending_buffers(struct aesd_dev *dev, const cha
 
         // offset into buffer should be 0 if another buffer was filled in the loop, or != 0 if the loop was never entered
         if ((bytes_not_copied = copy_from_user(pending_writes_item->buf + offset, buf + retval, bytes_left_to_copy))) {
-            printk(KERN_ERR "aesdchar: copy_from_user failed to copy %zu/%zu bytes", bytes_not_copied, bytes_left_to_copy);
+            PERROR("copy_from_user failed to copy %zu/%zu bytes", bytes_not_copied, bytes_left_to_copy);
             return -ENOMEM; // nothing is allocated for this, so nothing to free
         }
         // update counts
@@ -221,12 +382,12 @@ static struct aesd_buffer_entry *flush_pending_writes_into_new_entry(struct aesd
 
     // allocate new aesd_buffer_entry
     if (!(new_entry = kmalloc(sizeof(*new_entry), GFP_KERNEL))) {
-        printk(KERN_ERR "aesdchar: failed to allocate memory for new struct aesd_buffer_entry");
+        PERROR("failed to allocate memory for new struct aesd_buffer_entry");
         goto exit_fail;
     }
     // allocate buffer for pending data
     if (!(new_entry->buffptr = kmalloc(dev->bytes_pending * sizeof(*new_entry->buffptr), GFP_KERNEL))) {
-        printk(KERN_ERR "aesdchar: failed to allocate memory for buffer of size %li in new_entry", dev->bytes_pending);
+        PERROR("failed to allocate memory for buffer of size %li in new_entry", dev->bytes_pending);
         goto free_entry;
     }
     // set size of entry
@@ -239,7 +400,7 @@ static struct aesd_buffer_entry *flush_pending_writes_into_new_entry(struct aesd
         // copy buffer
         bytes_to_copy = min(bytes_left_to_copy, AESD_PENDING_WRITES_BUF_SIZE);
         if (! memcpy((char *) new_entry->buffptr + dev->bytes_pending - bytes_left_to_copy, pending_writes_item->buf, bytes_to_copy)) {
-            printk(KERN_ERR "aesdchar: failed to copy %zu bytes into buffer in new entry at offset %zu", bytes_to_copy, dev->bytes_pending - bytes_left_to_copy);
+            PERROR("failed to copy %zu bytes into buffer in new entry at offset %zu", bytes_to_copy, dev->bytes_pending - bytes_left_to_copy);
             goto free_buffer_in_entry;
         }
         // update counts
@@ -285,7 +446,7 @@ static inline bool is_pending_data_newline_terminated(struct aesd_dev *dev) {
 
     // find last entry
     if (!(pending_writes_item = find_pending_writes_item_at_offset(dev, offset))) {
-        printk(KERN_ERR "aesdchar: failed to find pending_writes_item at offset %zu", offset);
+        PERROR("failed to find pending_writes_item at offset %zu", offset);
         return false; // what else can you do
     }
 
@@ -370,7 +531,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
      */
     if (mutex_lock_interruptible(&dev->mutex)) {
         // lock attempt was interrupted
-        printk(KERN_ERR "aesdchar: mutex_lock_interruptible failed");
+        PERROR("mutex_lock_interruptible failed in read");
         return -ERESTARTSYS;
     }
 
@@ -384,7 +545,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
     entry = aesd_circular_buffer_find_entry_offset_for_fpos(dev->circular_buffer, *f_pos, &offset_in_buffptr);
 
     /* if (! entry) {
-        printk(KERN_ERR "aesdchar: can't find entry for f_pos %lld", *f_pos);
+        PERROR("can't find entry for f_pos %lld", *f_pos);
         retval = -EFAULT;
         goto unlock;
     } */
@@ -393,7 +554,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
     if (entry && entry->size > offset_in_buffptr && entry->buffptr) {
         bytes_to_copy = min(count, entry->size - offset_in_buffptr);
         if ((bytes_not_copied = copy_to_user(buf, entry->buffptr + offset_in_buffptr, bytes_to_copy))) {
-            printk(KERN_ERR "aesdchar: copy_to_user failed to copy %zu/%zu bytes", bytes_not_copied, bytes_to_copy);
+            PERROR("copy_to_user failed to copy %zu/%zu bytes", bytes_not_copied, bytes_to_copy);
             retval = -EFAULT;
             goto unlock;
         }
@@ -434,7 +595,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
      */
     if (mutex_lock_interruptible(&dev->mutex)) {
         // lock attempt was interrupted
-        printk(KERN_ERR "aesdchar: mutex_lock_interruptible failed");
+        PERROR("mutex_lock_interruptible failed in write");
         return -ERESTARTSYS;
     }
 
@@ -453,9 +614,15 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
      * Returns number of bytes copied, therefore the return value of this function
      */
     if (!(retval = copy_from_user_to_pending_buffers(dev, buf, count))) {
-        printk(KERN_ERR "aesdchar: failed to copy %zu bytes into pending writes buffer", count);
+        PERROR("failed to copy %zu bytes into pending writes buffer", count);
         goto unlock;
     }
+
+    /**
+     * Update f_pos so llseek can wrok properly
+     * even though it is not used to determine where to write
+     */
+    *f_pos += retval;
 
     /**
      * Everything should be copied to the pending buffer here
@@ -470,7 +637,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     if (is_pending_data_newline_terminated(dev)) {
             
             if (!(new_entry = flush_pending_writes_into_new_entry(dev))) {
-                printk(KERN_ERR "aesdchar: failed to create new entry with pending data");
+                PERROR("failed to create new entry with pending data");
                 goto unlock;
             }
 
@@ -492,12 +659,159 @@ unlock:
 
     return retval;
 }
+
+
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence) {
+
+    loff_t  retval, // offset sought into file
+            size; // size of device, total number of bytes written to it
+    struct aesd_dev *dev = filp->private_data;
+
+    PDEBUG("llseek offset %lld with mode %d", offset, whence);
+
+    /**
+     * START OF CRITICAL SECTION
+     */
+    if (mutex_lock_interruptible(&dev->mutex)) {
+        // lock attempt was interrupted
+        PERROR("mutex_lock_interruptible failed in llseek");
+        return -ERESTARTSYS;
+    }
+
+    // size of device, used for checks or SEEK_END
+    size = get_size(dev);
+
+    // handle different mode
+    switch (whence)  {
+        case SEEK_SET: // from start
+
+            // offset must then be positive, and <= the size of the device
+            if (offset < 0 || offset > size) {
+                PERROR("offset %lld is out of bounds [0,%lld] for mode SEEK_SET", offset, size);
+                retval = -EINVAL;
+                goto unlock;
+            }
+
+            // update f_pos
+            filp->f_pos = offset;
+
+            break;
+        case SEEK_CUR: // from current position
+
+            // offset + current f_pos must be positive and <= the size of the device
+            if (offset < -filp->f_pos || offset > size-filp->f_pos) {
+                PERROR("offset %lld is out of bounds [%lld,%lld] for mode SEEK_CUR", offset, -filp->f_pos, size-filp->f_pos);
+                retval = -EINVAL;
+                goto unlock;
+            }
+
+            // update f_pos
+            filp->f_pos += offset;
+
+            break;
+        case SEEK_END: // from end
+
+            /** 
+             * offset + size - 1 must be positive and < the size of the device
+             * if size is 0 the call always fails, min() makes 0 a valid argument at least
+             * this is the scenario if the device is opened in append mode
+             */
+            if (offset < min(0,-size+1) || offset > 0) {
+                PERROR("offset %lld is out of bounds [%lld,0] for mode SEEK_END", offset, min(0,-size+1));
+                retval = -EINVAL;
+                goto unlock;
+            }
+
+            // update f_pos
+            filp->f_pos = min(0, size-1 + offset);
+
+            break;
+        default:
+            PERROR("invalid seek mode %d", whence);
+            retval = -EINVAL;
+            goto unlock;
+    }
+
+    // success
+    retval = 0;
+
+    /**
+     * Let kernel methods implement the logic.
+     * It seems trivial but we can only do a worse job realistically.
+     
+    size = get_size(dev);
+    if ((retval = fixed_size_llseek(filp, offset, whence, size) < 0)) {
+        PERROR("fixed_size_llseek returned %lld", retval);
+        goto unlock;
+    }*/
+
+    /**
+     * END OF CRITICAL SECTION
+     */
+unlock:
+    mutex_unlock(&dev->mutex);
+
+    return retval;
+}
+
+
+long aesd_unlocked_ioctl(struct file *filp, unsigned int request, unsigned long arg) {
+
+    long retval;
+    void *argptr = NULL; // holds the pointer where to copy data referenced by arg, when arg is a user pointer. Shall be malloc'd in the relevant swtich-case branch.
+
+    switch (request) {
+        case AESDCHAR_IOCSEEKTO:
+
+            // no segfaults thanks
+            if (!arg) {
+                PERROR("AESDCHAR_IOCSEEKTO was provided a (struct aesd_seekto *) NULL pointer as argument");
+                retval = -EINVAL;
+                break;
+            }
+
+            // malloc memory to copy user arguments
+            if (!(argptr = kmalloc(sizeof(struct aesd_seekto), GFP_KERNEL))) {
+                PERROR("AESDCHAR_IOCSEEKTO kmalloc failed to allocate for struct aesd_seekto");
+                retval = -ENOMEM;
+                break;
+            }
+
+            // copy user arguments
+            if (copy_from_user(argptr, (const void __user *)arg, sizeof(struct aesd_seekto))) {
+                PERROR("AESDCHAR_IOCSEEKTO copy_from_user failed to copy struct aesd_seekto argument");
+                retval = -EFAULT;
+                break;
+            }
+
+            // call function that implements ioctl, arg shall be casted to the appropriate type
+            retval = aesd_adjust_file_offset(
+                filp, 
+                ((struct aesd_seekto *)argptr)->write_cmd, 
+                ((struct aesd_seekto *)argptr)->write_cmd_offset
+            );
+
+            break;
+
+        default: // Inappropriate I/O control operation
+            retval = -ENOTTY;
+    }
+
+    // free argument pointer in kernel if it was used
+    if (argptr) kfree(argptr);
+
+    return retval;
+}
+
+
 struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
+    .owner          = THIS_MODULE,
+    .read           = aesd_read,
+    .write          = aesd_write,
+    .open           = aesd_open,
+    .release        = aesd_release,
+    .llseek         = aesd_llseek,
+    .unlocked_ioctl = aesd_unlocked_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
@@ -509,7 +823,7 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
     dev->cdev.ops = &aesd_fops;
     err = cdev_add (&dev->cdev, devno, 1);
     if (err) {
-        printk(KERN_ERR "aesdchar: Error %d adding aesd cdev", err);
+        PERROR("error %d adding aesd cdev", err);
     }
     return err;
 }
@@ -535,7 +849,7 @@ int aesd_init_module(void)
 
     // malloc circular buffer member, no submember to malloc after
     if (!(aesd_device.circular_buffer = kmalloc(sizeof(*aesd_device.circular_buffer), GFP_KERNEL))) {
-        printk(KERN_ERR "aesdchar: failed to allocate memory for circular buffer");
+        PERROR("failed to allocate memory for circular buffer");
         result = -ENOMEM;
         goto cleanup;
     }
@@ -543,7 +857,7 @@ int aesd_init_module(void)
 
     // malloc pending writes head, buf submember should be allocated after
     if (!(aesd_device.pending_writes_head = kmalloc(sizeof(*aesd_device.pending_writes_head), GFP_KERNEL))) {
-        printk(KERN_ERR "aesdchar: failed to allocate memory for pending_writes_head");
+        PERROR("failed to allocate memory for pending_writes_head");
         result = -ENOMEM;
         goto cleanup;
     }
@@ -554,7 +868,7 @@ int aesd_init_module(void)
             sizeof(*aesd_device.pending_writes_head->buf) * AESD_PENDING_WRITES_BUF_SIZE, GFP_KERNEL
         ))) {
 
-        printk(KERN_ERR "aesdchar: failed to allocate memory for pending_writes_head->buf");
+        PERROR("failed to allocate memory for pending_writes_head->buf");
         result = -ENOMEM;
         goto cleanup;
     }
@@ -565,7 +879,7 @@ int aesd_init_module(void)
     // add cdev to kernel, device is live from here
     result = aesd_setup_cdev(&aesd_device);
     if( result ) {
-        printk(KERN_ERR "aesdchar: failed to setup cdev (maj %d min %d) with error %d", MAJOR(dev), MINOR(dev), result);
+        PERROR("failed to setup cdev (maj %d min %d) with error %d", MAJOR(dev), MINOR(dev), result);
         goto cleanup;
     }
 

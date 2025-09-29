@@ -220,21 +220,26 @@ static int get_ip_as_string_from_sockaddr(struct sockaddr *sockaddr, char *addr_
 }
 
 
-// send contents of file *filp over socket sockfd
-static ssize_t send_file_contents(int sockfd, char *filename) {
+/**
+ * Read contents of fp and send them over sockfd
+ * fp should be rewound and opened for reading by the caller
+ * Locking should be handled by the caller
+ * @param sockfd: file descriptor of connection over socket
+ * @param fp: file pointer to the file to read contents from
+ * @returns the number of bytes read from file and sent on socket
+ */
+static ssize_t send_file_contents(int sockfd, FILE *fp) {
 
     ssize_t n_bytes_sent = 0, n_bytes_sent_this_iter;
     size_t n_bytes_read = 0;
-    FILE *fp;
 
-	char *buf = malloc(sizeof(char *) * BUF_SIZE);
+	char *buf = malloc(sizeof(char) * BUF_SIZE);
 	if (NULL == buf) {
 		return -ENOMEM;
 	}
 
-    // open file in read mode
-    fp = fopen(filename, "r");
     if (NULL == fp) {
+		free(buf);
         return -ENOENT;
     }
 
@@ -260,7 +265,6 @@ static ssize_t send_file_contents(int sockfd, char *filename) {
 
     }
 
-    fclose(fp);
 	free(buf);
     return n_bytes_sent;
 }
@@ -271,7 +275,6 @@ static ssize_t send_file_contents(int sockfd, char *filename) {
 * 	into open file "to" (second arg)
 *
 * Returns number of characters copied
-* No error handling for now, what can possibly go wrong? ;)
 */
 static ssize_t copy_file_contents(FILE *from, FILE* to) {
 
@@ -279,7 +282,9 @@ static ssize_t copy_file_contents(FILE *from, FILE* to) {
 	ssize_t n_chars_copied = 0;
 
 	while ((char_to_copy = fgetc(from)) != EOF) {
-		fputc(char_to_copy, to);
+		if (EOF == fputc(char_to_copy, to)) {
+			break;
+		}
 		n_chars_copied++;
 	}
 
@@ -291,7 +296,7 @@ static ssize_t copy_file_contents(FILE *from, FILE* to) {
  * Signal handler function
  * The main server loop will exit after completing the current iteration
  * upon receiving SIGINT and SIGTERM
-*/
+ */
 static void signal_handler(int signum) {
 
     switch (signum) {
@@ -321,8 +326,7 @@ static void signal_handler(int signum) {
 * - 0 on success, 
 * - error code otherwise (see errno.h)
 */
-static int append_thread_list_entry(struct thread_list_head *head,
-							 struct thread_list_entry **tail) {
+static int append_thread_list_entry(struct thread_list_head *head, struct thread_list_entry **tail) {
 
 	struct thread_list_entry *new_entry;
 	int retval;
@@ -348,11 +352,13 @@ static int append_thread_list_entry(struct thread_list_head *head,
 		}
 		else { // other threads are running, append to last element
 
-			// in case tail is NULL for whatever reason, 
-			// find it by moving down the linked list
-			// or tail->next causes a segmentation fault
-			// according to valgrind sometimes tail can point to freed 
-			// memory, let's not trust its value anymore and just find it here
+			/**
+			 * in case tail is NULL for whatever reason, 
+			 * find it by moving down the linked list
+			 * or tail->next causes a segmentation fault
+			 * according to valgrind sometimes tail can point to freed
+			 * memory, let's not trust its value anymore and just find it here
+			 */
 			for (*tail = head->first; (*tail)->next; *tail = (*tail)->next); // head->first cannot be NULL if we're in this branch
 
 			(*tail)->next = new_entry;
@@ -365,6 +371,85 @@ static int append_thread_list_entry(struct thread_list_head *head,
 		retval = EXIT_SUCCESS;
 	}
 
+	return retval;
+}
+
+
+/**
+ * Routine to do based on the packet received
+ * The contents of thread_dumpfile_fd are parsed and the specified command is executed.
+ * If the packet does not contain a command, it is written to dumpfile_fd.
+ * Locking must be handled by the caller.
+ * @param thread_dumpfile_fd: buffer where packet are stored before being interpreted
+ * @param dumpfile_fd: file where any action specified by the packet is carried on to
+ * @returns 0 on success, errno otherwise
+ */
+int full_packet_routine(FILE *thread_dumpfile_fd, FILE *dumpfile_fd) {
+
+	int retval;
+	char *command = NULL; // buffer allocated by fscanf, shall be free'd
+
+	// separate command and arguments from command string in thread_dumpfile
+	if (! fscanf(thread_dumpfile_fd, "%m[^:\n]s", &command)) {
+		syslog(LOG_ERR, "failed to parse packet");
+		return EINVAL;
+	}
+
+	//syslog(LOG_DEBUG, "allocated buffer for command at %p, containing %s", command, command);
+
+	// check if it's a command
+	if (! strcmp(command, "AESDCHAR_IOCSEEKTO")) {
+
+		struct aesd_seekto args = {0};
+
+		// parse arguments of command
+		if (fscanf(thread_dumpfile_fd, ":%d,%d", &args.write_cmd, &args.write_cmd_offset) < 2) {
+			syslog(LOG_ERR, "failed to parse arguments for command AESDCHAR_IOCSEEKTO");
+			retval = EINVAL;
+			goto out;
+		}
+
+		// issue ioctl syscall
+		if (-1 == ioctl(fileno(dumpfile_fd), AESDCHAR_IOCSEEKTO, &args)) {
+			retval = errno;
+			syslog(LOG_ERR, "ioctl failed with error %d (%s)", retval, strerror(retval));
+			goto out;
+		}
+
+		retval = 0;
+	}
+	else { // default, copy to dumpfile
+
+		ssize_t n_bytes_dumped;
+
+		/**
+		 * Rewind back to start, the command buffer matched an arbitrary number of characters
+		 * which would be skipped otherwise
+		 */
+		rewind(thread_dumpfile_fd);
+
+		// dump contents of thread_dumpfile into shared dumpfile
+		n_bytes_dumped = copy_file_contents(thread_dumpfile_fd, dumpfile_fd);
+		if (0 == n_bytes_dumped) {
+			syslog(LOG_ERR, "Couldn't dump packet to file %s.", DUMPFILE_NAME);
+			retval = ENOMEM;
+			goto out;
+		}
+		syslog(LOG_DEBUG, "Dumped %li bytes to file %s", n_bytes_dumped, DUMPFILE_NAME);
+
+		/**
+		 * reset read cursor on dumpfile. 
+		 * do it here so it doesn't affect seek operations done by other commands
+		 */ 
+		rewind(dumpfile_fd);
+
+		retval = 0;
+
+	} // end of command switch
+
+
+out:
+	if (command) free(command);
 	return retval;
 }
 
@@ -392,7 +477,12 @@ static void cleanup_threads(struct thread_list_head *head, char *ip_addr_string,
 			// close socket
 			rc = close(entry->thread_data.connected_sockfd);
 			if (0 != rc) {
-				syslog(LOG_ERR, "Error %d (%s) on closing connected socket %i", errno, strerror(errno), entry->thread_data.connected_sockfd);
+				syslog(LOG_ERR, 
+					"Error %d (%s) on closing connected socket %i", 
+					errno, 
+					strerror(errno), 
+					entry->thread_data.connected_sockfd
+				);
 			}
 
 			// log message based on thread result 
@@ -407,13 +497,19 @@ static void cleanup_threads(struct thread_list_head *head, char *ip_addr_string,
 					syslog(LOG_DEBUG, "Closed connection with %s", ip_addr_string);
 					break;
 				case (COMPL_ERROR):
-					syslog(LOG_ERR, "Error %d (%s) on receiving from %s on port %s", \
-									entry->thread_data.retval, \
-									strerror(entry->thread_data.retval), \
-									ip_addr_string, PORTNO);
+					syslog(LOG_ERR, 
+						"Error %d (%s) on receiving from %s on port %s",
+						entry->thread_data.retval,
+						strerror(entry->thread_data.retval),
+						ip_addr_string, PORTNO
+					);
 					break;
 				default:
-					syslog(LOG_ERR, "Thread for client %s completed with unknown status %d", ip_addr_string, entry->thread_data.status);
+					syslog(LOG_ERR, 
+						"Thread for client %s completed with unknown status %d", 
+						ip_addr_string, 
+						entry->thread_data.status
+					);
 			}
 
 
@@ -464,7 +560,7 @@ static void *thread_routine(void *arg) {
 	thread_data = (typeof(thread_data)) arg;
 	thread_data->status = RUNNING;
 
-	receive_buf = malloc(sizeof(char *) * BUF_SIZE);
+	receive_buf = malloc(sizeof(char) * BUF_SIZE);
 	if (NULL == receive_buf) {
 		retval = -ENOMEM;
 		goto exit;
@@ -537,8 +633,7 @@ static void *thread_routine(void *arg) {
 			*/
 			if (full_packet_received) {
 				// lock mutex
-				rc = lock_dumpfile(thread_data->mutex);
-				if (0 != rc) { // error on acquiring the lock
+				if ((rc = lock_dumpfile(thread_data->mutex)) != 0) { // error on acquiring the lock
 					syslog(LOG_ERR, "Error %d (%s) on locking mutex.", rc, strerror(rc));
 					retval = rc;
 					goto free_buffers_and_exit;
@@ -550,8 +645,12 @@ static void *thread_routine(void *arg) {
 				* the thread will block here until mutex is acquired
 				*/
 
-				// open dump file in append mode
-				dumpfile_fd = fopen(DUMPFILE_NAME, "a");
+				/** 
+				 * open dumpfile in read/append mode
+				 * the file should be kept open between the write and the read operations
+				 * so any seek operation has an effect for the read
+				 */
+				dumpfile_fd = fopen(DUMPFILE_NAME, "a+");
 				if (NULL == dumpfile_fd) {
 					syslog(LOG_ERR, "Error %d (%m) on opening file %s.", errno, DUMPFILE_NAME);
 					retval = E_ON_SOCKET;
@@ -565,36 +664,39 @@ static void *thread_routine(void *arg) {
 				// reset read cursor on thread_dumpfile. file needs to stay open to prevent other accesses
 				rewind(thread_dumpfile_fd); // pre-copy
 
-				// dump contents of thread_dumpfile into shared dumpfile
-				n_bytes_dumped = copy_file_contents(thread_dumpfile_fd, dumpfile_fd);
-				if (0 == n_bytes_dumped) {
-					syslog(LOG_ERR, "Couldn't dump packet to file %s.", DUMPFILE_NAME);
-					// what now???
-
-					// don't forget we're in the critical section
+				// do the action requested by packet
+				if ((rc = full_packet_routine(thread_dumpfile_fd, dumpfile_fd))) {
+					syslog(LOG_ERR, "full_packet_routine failed with error %d (%s)", rc, strerror(rc));
+					// go ahead, closing files, returning data, waiting for more data
 				}
-				syslog(LOG_DEBUG, "Dumped %li bytes to file %s", n_bytes_dumped, DUMPFILE_NAME);
-
-				// close file so it's available for reading
-				fclose(dumpfile_fd);
 
 				// reset read cursor on thread_dumpfile. file needs to stay open to prevent other accesses
 				rewind(thread_dumpfile_fd); // post-copy, file truncated for the next cycle
-				if (truncate(thread_dumpfile_name, 0)) {
-					syslog(LOG_ERR, "Error %d (%m) truncating file %s", errno, thread_dumpfile_name);
+				if (ftruncate(fileno(thread_dumpfile_fd), 0)) {
+					syslog(LOG_ERR, "error %d (%m) truncating file %s", errno, thread_dumpfile_name);
 				}
 
-				// keep the lock or some other thread might dump its own packets
-				// and our sender will receive wrong data later
+				/**
+				 * keep the lock or some other thread might dump its own packets
+				 * and our sender will receive wrong data later
+				 */
 
-				// send back full contents of the file
-				// might take a while and block everything... 
-				n_bytes_sent = send_file_contents(thread_data->connected_sockfd, DUMPFILE_NAME);
+				/**
+				 * keep file open so any seek operations done as part of packet
+				 * processing are effective on the next read
+				 */
+
+				/**
+				 * send back full contents of the file
+				 * might take a while and block everything... 
+				 */
+				n_bytes_sent = send_file_contents(thread_data->connected_sockfd, dumpfile_fd);
 				if (n_bytes_sent <= 0) {
-					syslog(LOG_ERR, "Couldn't read dumpfile and send data on socket");
+					syslog(LOG_ERR, "couldn't read dumpfile and send data on socket");
 					retval = E_ON_SOCKET;
 
 					// don't forget we're in the critical section
+					fclose(dumpfile_fd);
 					unlock_dumpfile(thread_data->mutex);
 
 					goto close_thread_dumpfile_and_exit;
@@ -606,7 +708,7 @@ static void *thread_routine(void *arg) {
 				*
 				* make sure every way out of the critical section involves releasing the lock
 				*/
-
+				fclose(dumpfile_fd);
 				unlock_dumpfile(thread_data->mutex);
 
 				full_packet_received = false;
@@ -911,7 +1013,8 @@ main_body:
 		// if a thread is complete, join it, clean up its dyn allocated data, remove it from list
 		cleanup_threads(&thread_list_head, ip_addr_string, false);
 
-
+		// give the CPU a little break
+		usleep(MAIN_LOOP_SLEEP_USECS);
     }
 
     // if the main loop has been interrupted we received a signal to terminate

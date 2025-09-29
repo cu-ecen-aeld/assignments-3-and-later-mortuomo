@@ -10,12 +10,14 @@
 #include <syslog.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <signal.h>
 #include <poll.h>
 #include <time.h>
 #include <pthread.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define LOG_IDENT       NULL                        // program identity shown in logs (defaults to the name of the executable)
 #define PORTNO          "9000"                      // port to open for listening
@@ -24,6 +26,7 @@
 #define BUF_SIZE        256                         // bytes received at a time from socket
 #define TIMER_INTERVAL_SECONDS		10				// period for timestamping dumpfile
 #define MAX_TIMER_CREATE_ATTEMPTS 	10				// number of retries if timer_creates returns EAGAIN
+#define MAIN_LOOP_SLEEP_USECS		100000			// microseconds to sleep between iterations of the main loop
 
 // if 1 writes to aesd char device, if 0 writes to tempfile
 #define USE_AESD_CHAR_DEVICE 1
